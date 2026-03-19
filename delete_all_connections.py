@@ -18,9 +18,9 @@ import requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-POD           = "dmp-us"                      # e.g. dmp-us
-USERNAME      = "shayes_compass_debug"
-PASSWORD = "Infa2025c!"          # your IDMC login password
+POD      = os.getenv("IDMC_POD",      "dmp-us")
+USERNAME = os.getenv("IDMC_USERNAME", "your_username_here")
+PASSWORD = os.getenv("IDMC_PASSWORD", "your_password_here")
 # ---------------------------------------------------------------------------
 
 POD_URL = f"https://{POD}.informaticacloud.com"
