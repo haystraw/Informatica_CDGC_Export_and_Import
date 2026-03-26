@@ -15,14 +15,58 @@ Usage:
 import os
 import sys
 import argparse
+import configparser
 import requests
+
+
+_INI_FILENAME = "cdgc_config.ini"
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_ini_cache    = None
+
+
+def _load_ini() -> dict:
+    global _ini_cache
+    if _ini_cache is not None:
+        return _ini_cache
+    cp = configparser.ConfigParser(interpolation=None)
+    for base in (_SCRIPT_DIR, os.getcwd()):
+        path = os.path.join(base, _INI_FILENAME)
+        if os.path.isfile(path):
+            cp.read(path, encoding="utf-8")
+            print(f"  [config] Loaded {path}")
+            break
+    _ini_cache = dict(cp["config"]) if cp.has_section("config") else {}
+    return _ini_cache
+
+
+def get(full_key: str, default: str = "") -> str:
+    ini = _load_ini()
+    val = ini.get(full_key.lower(), "").strip()
+    if val:
+        return val
+    for env_key in (full_key, full_key.upper()):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    return default
+
+
+def get_bool(full_key: str, default: bool = True) -> bool:
+    val = get(full_key).lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return default
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-POD      = os.getenv("IDMC_POD",      "dmp-us")
-USERNAME = os.getenv("IDMC_USERNAME", "your_username_here")
-PASSWORD = os.getenv("IDMC_PASSWORD", "your_password_here")
+P = "cdgc_delete_resources"
+POD      = get(f"{P}_pod",      "dmp-us")
+USERNAME = get(f"{P}_username", "your_username_here")
+PASSWORD = get(f"{P}_password", "your_password_here")
+CONFIRM  = get_bool(f"{P}_confirm", True)
 # ---------------------------------------------------------------------------
 
 
@@ -224,17 +268,28 @@ def delete_catalog_sources(auth, dry_run):
 # ---------------------------------------------------------------------------
 
 def main():
+    global POD, USERNAME, PASSWORD, CONFIRM
+
     parser = argparse.ArgumentParser(description="Delete all catalog sources and/or connections")
+    parser.add_argument(f"--{P}_pod",      default=POD,      metavar="POD",  dest="pod")
+    parser.add_argument(f"--{P}_username", default=USERNAME, metavar="USER", dest="username")
+    parser.add_argument(f"--{P}_password", default=PASSWORD, metavar="PASS", dest="password")
+    parser.add_argument(f"--{P}_no_confirm", action="store_true", dest="no_confirm")
+    parser.add_argument("--go",              action="store_true", help="Actually delete (default is dry run)")
     parser.add_argument("--connections",     action="store_true", help="Also delete connections (default: catalog sources only)")
     parser.add_argument("--catalog-sources", action="store_true", help="Delete catalog sources (included by default)")
-    parser.add_argument("--go",              action="store_true", help="Actually delete (default is dry run)")
     args = parser.parse_args()
+
+    POD      = args.pod
+    USERNAME = args.username
+    PASSWORD = args.password
+    if args.no_confirm:
+        CONFIRM = False
+    pod_url  = f"https://{POD}.informaticacloud.com"
 
     run_catalog_sources = True
     run_connections     = args.connections
     dry_run = not args.go
-
-    pod_url = f"https://{POD}.informaticacloud.com"
 
     print("=" * 60)
     print("CDGC Delete All Resources")
@@ -261,15 +316,18 @@ def main():
     scope = ("connections + catalog sources" if run_connections and run_catalog_sources
              else "connections only" if run_connections
              else "catalog sources only")
-    print(f"\n{'=' * 60}")
-    print(f"  WARNING: About to permanently delete {scope}")
-    print(f"  Logged in as : {auth['user_name']}")
-    print(f"  Org          : {auth['org_name']} ({auth['org_id']})")
-    print(f"{'=' * 60}")
-    confirm = input("  Type YES to confirm: ").strip()
-    if confirm != "YES":
-        print("  Aborted.")
-        return
+    if CONFIRM:
+        print(f"\n{'=' * 60}")
+        print(f"  WARNING: About to permanently delete {scope}")
+        print(f"  Logged in as : {auth['user_name']}")
+        print(f"  Org          : {auth['org_name']} ({auth['org_id']})")
+        print(f"{'=' * 60}")
+        confirm = input("  Type YES to confirm: ").strip()
+        if confirm != "YES":
+            print("  Aborted.")
+            return
+    else:
+        print(f"\n  Confirmation disabled; proceeding to delete {scope}.")
 
     print()
     if run_catalog_sources:

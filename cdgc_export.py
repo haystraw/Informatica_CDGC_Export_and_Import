@@ -1,26 +1,34 @@
 """
 cdgc_export.py
 
-Exports all CDGC Catalog Sources to individual JSON files (with system/read-only
-fields stripped), and builds role + group lookup tables as JSON files.
+Exports connections and CDGC catalog sources, then bundles everything into a
+single timestamped zip file.  The zip is the sole output artifact — no
+persistent export directory is left behind.
 
-Output structure:
-  ./export/
-    catalog_sources/
-      <catalog_source_name>.json   (one file per source, clean payload)
-    roles_lookup.json              (id -> roleName mapping)
-    groups_lookup.json             (id -> userGroupName mapping)
+Output:
+  export_<timestamp>.zip  (written to cdgc_export_zip_dir, default: CWD)
+
+Inside the zip:
+  catalog_sources/<name>.json
+  catalog_source_zips/<name>.zip
+  connections/<name>.json
+  roles_lookup.json
+  runtime_environments_lookup.json
+  connections_lookup.json
+  catalog_sources_id_lookup.json
+  classifications_lookup.json
+  encrypted_fields_empty.csv   (fill in, rename to encrypted_fields.csv, use on import)
 
 Usage:
-  python cdgc_export.py
+  python cdgc_export.py [--cdgc_export_pod POD] [--cdgc_export_username USER]
+                        [--cdgc_export_password PASS] [--cdgc_export_zip_dir DIR]
+                        [--cdgc_export_no_zips] [--cdgc_export_no_connections]
+                        [--cdgc_export_no_catalog_sources]
+                        [--cdgc_export_filter_connections REGEX]
+                        [--cdgc_export_filter_catalog_sources REGEX]
 
-Configure the constants below, or set environment variables:
-  IDMC_BASE_URL   e.g. https://dm-us.informaticacloud.com
-  IDMC_USERNAME
-  IDMC_PASSWORD
-
-Org ID is extracted automatically from the login response (currentOrgId) --
-no need to configure it separately.
+Configure via cdgc_config.ini [config] section, environment variables, or CLI args.
+All three mechanisms use the same key names (e.g. cdgc_export_username).
 """
 
 import os
@@ -28,40 +36,83 @@ import csv
 import json
 import re
 import datetime
+import argparse
+import zipfile
+import shutil
+import tempfile
+import configparser
 import requests
 
+
+_INI_FILENAME = "cdgc_config.ini"
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_ini_cache    = None
+
+
+def _load_ini() -> dict:
+    global _ini_cache
+    if _ini_cache is not None:
+        return _ini_cache
+    cp = configparser.ConfigParser(interpolation=None)
+    for base in (_SCRIPT_DIR, os.getcwd()):
+        path = os.path.join(base, _INI_FILENAME)
+        if os.path.isfile(path):
+            cp.read(path, encoding="utf-8")
+            print(f"  [config] Loaded {path}")
+            break
+    _ini_cache = dict(cp["config"]) if cp.has_section("config") else {}
+    return _ini_cache
+
+
+def get(full_key: str, default: str = "") -> str:
+    ini = _load_ini()
+    val = ini.get(full_key.lower(), "").strip()
+    if val:
+        return val
+    for env_key in (full_key, full_key.upper()):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    return default
+
+
+def get_bool(full_key: str, default: bool = True) -> bool:
+    val = get(full_key).lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return default
+
 # ---------------------------------------------------------------------------
-# Configuration -- edit here or set environment variables
+# Configuration — defaults come from INI file, env vars, then hardcoded values
 # ---------------------------------------------------------------------------
-# Pod identifier — the regional segment of the Informatica Cloud URLs
-# e.g. "dm-us", "dm-eu", "dm-ap", etc.
-POD        = os.getenv("IDMC_POD",      "dmp-us")
+P = "cdgc_export"   # prefix for all keys in this script
 
-IDMC_URL   = f"https://{POD}.informaticacloud.com"        # {{url}} in Postman
-API_URL    = f"https://idmc-api.{POD}.informaticacloud.com"  # {{api.url}} in Postman
+POD      = get(f"{P}_pod",      "dmp-us")
+USERNAME = get(f"{P}_username", "your_username_here")
+PASSWORD = get(f"{P}_password", "your_password_here")
 
-USERNAME   = os.getenv("IDMC_USERNAME", "shayes_compass")
-PASSWORD   = os.getenv("IDMC_PASSWORD", "Infa2025c!")
+# Where to write the final zip (default: current working directory)
+ZIP_DIR = get(f"{P}_zip_dir", ".")
 
-OUTPUT_DIR   = "./export"
-CS_DIR       = os.path.join(OUTPUT_DIR, "catalog_sources")
-CS_ZIPS_DIR  = os.path.join(OUTPUT_DIR, "catalog_source_zips")
-CONN_DIR     = os.path.join(OUTPUT_DIR, "connections")
+# Optional explicit temp dir; supports {timestamp}. If blank, OS temp is used.
+TEMP_DIR_TEMPLATE = get(f"{P}_temp_dir", "")
 
-# Set True to download zip files for custom catalog sources during export.
-# These zips are required for the import to succeed — without them the import
-# fails with a staging-file-not-found 500 error.
-DOWNLOAD_ZIPS = True
+# These are set dynamically at runtime from the temp staging dir
+OUTPUT_DIR  = None
+CS_DIR      = None
+CS_ZIPS_DIR = None
+CONN_DIR    = None
 
-# ---------------------------------------------------------------------------
-# Name filters (for troubleshooting — leave None to include everything)
-# Set to a regex string to export only matching connections / catalog sources.
-# Examples:
-#   FILTER_CONNECTIONS     = r"Snowflake|Oracle"
-#   FILTER_CATALOG_SOURCES = r"Lineage"
-# ---------------------------------------------------------------------------
-FILTER_CONNECTIONS     = None
-FILTER_CATALOG_SOURCES = r"^(?!.*Tableau)"   # exclude anything with "Tableau" in the name
+DOWNLOAD_ZIPS          = get_bool(f"{P}_download_zips",          True)
+ENABLE_CONNECTIONS     = get_bool(f"{P}_enable_connections",     True)
+ENABLE_CATALOG_SOURCES = get_bool(f"{P}_enable_catalog_sources", True)
+FILTER_CONNECTIONS     = get(f"{P}_filter_connections")     or None
+FILTER_CATALOG_SOURCES = get(f"{P}_filter_catalog_sources") or None
+
+IDMC_URL = f"https://{POD}.informaticacloud.com"
+API_URL  = f"https://idmc-api.{POD}.informaticacloud.com"
 
 # Fields returned by GET that the PUT endpoint does not accept
 STRIP_FIELDS = {
@@ -238,6 +289,14 @@ def strip_fields(source):
 def safe_filename(name):
     """Converts a catalog source name into a safe filename."""
     return re.sub(r'[\\/*?:"<>|]', "_", name)
+
+
+def normalize_name_for_filename(name):
+    """Normalizes a display name into a compact filename-safe token."""
+    cleaned = safe_filename(name or "").strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("._")
+    return cleaned.lower() or "unknown_org"
 
 
 # Keys used (in priority order) to sort arrays of dicts within a catalog source
@@ -527,40 +586,56 @@ def find_encrypted_fields(obj, prefix=""):
     return found
 
 
-def export_encrypted_fields_csv(conn_dir, output_dir):
+def export_encrypted_fields_csv(conn_dir, cs_dir, output_dir):
     """
-    Scans all exported connection JSON files for masked ('********') fields
-    and writes a template CSV the user can fill in before importing.
+    Scans exported connections and catalog sources for encrypted/masked fields
+    and writes a single combined template CSV the user can fill in before importing.
 
-    Output: export/encrypted_fields_connections_<timestamp>.csv
-    Columns: Connection Name, Parameter Name, Value
+    Output: <output_dir>/encrypted_fields_<timestamp>.csv
+    Columns: Type, Name, Parameter, Value
+      Type = "Connection"       for connection masked fields (******** sentinel)
+             "Catalog Resource" for catalog source AAA-encrypted blobs
     """
-    rows = []
-    for fname in sorted(os.listdir(conn_dir)):
-        if not fname.endswith(".json"):
-            continue
-        fpath = os.path.join(conn_dir, fname)
-        with open(fpath, encoding="utf-8") as f:
-            conn = json.load(f)
-        name = conn.get("name", fname[:-5])
-        for field_path in find_encrypted_fields(conn):
-            rows.append((name, field_path))
+    rows = []  # list of (type, name, parameter)
+
+    # Connections — masked with ********
+    if conn_dir and os.path.isdir(conn_dir):
+        for fname in sorted(os.listdir(conn_dir)):
+            if not fname.endswith(".json"):
+                continue
+            with open(os.path.join(conn_dir, fname), encoding="utf-8") as f:
+                conn = json.load(f)
+            name = conn.get("name", fname[:-5])
+            for field_path in find_encrypted_fields(conn):
+                rows.append(("Connection", name, field_path))
+
+    # Catalog sources — org-encrypted AAA blobs
+    if cs_dir and os.path.isdir(cs_dir):
+        for fname in sorted(os.listdir(cs_dir)):
+            if not fname.endswith(".json"):
+                continue
+            with open(os.path.join(cs_dir, fname), encoding="utf-8") as f:
+                cs = json.load(f)
+            name = cs.get("name", fname[:-5])
+            for json_path in find_encrypted_cs_fields(cs):
+                rows.append(("Catalog Resource", name, json_path))
 
     if not rows:
         print("  No encrypted fields found — CSV not created.")
         return None
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(output_dir, f"encrypted_fields_connections_{timestamp}.csv")
+    csv_path = os.path.join(output_dir, f"encrypted_fields_{timestamp}.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Connection Name", "Parameter Name", "Value"])
-        for conn_name, field_path in rows:
-            writer.writerow([conn_name, field_path, ""])
+        writer.writerow(["Type", "Name", "Parameter", "Value"])
+        for row_type, name, param in rows:
+            writer.writerow([row_type, name, param, ""])
 
-    uniq = len({r[0] for r in rows})
+    conn_count = sum(1 for r in rows if r[0] == "Connection")
+    res_count  = sum(1 for r in rows if r[0] == "Catalog Resource")
     print(f"  Wrote encrypted fields template: {csv_path}")
-    print(f"  ({len(rows)} field(s) across {uniq} connection(s) — fill in Value column before importing)")
+    print(f"  ({conn_count} connection field(s), {res_count} catalog resource field(s) — fill in Value column before importing)")
     return csv_path
 
 
@@ -600,41 +675,6 @@ def find_encrypted_cs_fields(payload):
     return found
 
 
-def export_encrypted_resources_csv(cs_dir, output_dir):
-    """
-    Scans all exported catalog source JSON files for Informatica-encrypted values
-    (org-specific base64 blobs that will not work in a different org) and writes
-    a template CSV the user can fill in before importing.
-
-    Output: export/encrypted_fields_resources_<timestamp>.csv
-    Columns: Catalog Source Name, JSON Path, Value
-    """
-    rows = []
-    for fname in sorted(os.listdir(cs_dir)):
-        if not fname.endswith(".json"):
-            continue
-        with open(os.path.join(cs_dir, fname), encoding="utf-8") as f:
-            cs = json.load(f)
-        name = cs.get("name", fname[:-5])
-        for json_path in find_encrypted_cs_fields(cs):
-            rows.append((name, json_path))
-
-    if not rows:
-        print("  No encrypted resource fields found — CSV not created.")
-        return None
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(output_dir, f"encrypted_fields_resources_{timestamp}.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["Catalog Source Name", "JSON Path", "Value"])
-        for cs_name, json_path in rows:
-            writer.writerow([cs_name, json_path, ""])
-
-    uniq = len({r[0] for r in rows})
-    print(f"  Wrote encrypted resource fields template: {csv_path}")
-    print(f"  ({len(rows)} field(s) across {uniq} catalog source(s) — fill in Value column before importing)")
-    return csv_path
 
 
 def export_connections(auth):
@@ -701,10 +741,7 @@ def export_connections(auth):
     print(f"  Saved {saved} connection file(s) to {CONN_DIR}/")
     print(f"  Saved {len(lookup)} connection(s) to {out_path}")
 
-    print("\n  Scanning for encrypted fields...")
-    enc_csv = export_encrypted_fields_csv(CONN_DIR, OUTPUT_DIR)
-
-    return lookup, enc_csv
+    return lookup
 
 
 # ---------------------------------------------------------------------------
@@ -760,46 +797,127 @@ def export_classifications(auth):
 # ---------------------------------------------------------------------------
 
 def main():
+    global POD, USERNAME, PASSWORD, ZIP_DIR, OUTPUT_DIR, CS_DIR, CS_ZIPS_DIR, CONN_DIR
+    global DOWNLOAD_ZIPS, ENABLE_CONNECTIONS, ENABLE_CATALOG_SOURCES
+    global FILTER_CONNECTIONS, FILTER_CATALOG_SOURCES, IDMC_URL, API_URL
+
+    parser = argparse.ArgumentParser(description="Export CDGC connections and catalog sources")
+    parser.add_argument(f"--{P}_pod",                    default=POD,      metavar="POD",  dest="pod")
+    parser.add_argument(f"--{P}_username",               default=USERNAME, metavar="USER", dest="username")
+    parser.add_argument(f"--{P}_password",               default=PASSWORD, metavar="PASS", dest="password")
+    parser.add_argument(f"--{P}_zip_dir",                default=ZIP_DIR,  metavar="DIR",  dest="zip_dir",
+                        help="Directory to write the output zip (default: current directory)")
+    parser.add_argument(f"--{P}_no_zips",                action="store_true", dest="no_zips",
+                        help="Skip downloading custom source zip files")
+    parser.add_argument(f"--{P}_no_connections",         action="store_true", dest="no_connections")
+    parser.add_argument(f"--{P}_no_catalog_sources",     action="store_true", dest="no_catalog_sources")
+    parser.add_argument(f"--{P}_filter_connections",     default=FILTER_CONNECTIONS,     metavar="REGEX", dest="filter_connections")
+    parser.add_argument(f"--{P}_filter_catalog_sources", default=FILTER_CATALOG_SOURCES, metavar="REGEX", dest="filter_catalog_sources")
+    args = parser.parse_args()
+
+    POD      = args.pod
+    USERNAME = args.username
+    PASSWORD = args.password
+    ZIP_DIR  = args.zip_dir
+    IDMC_URL = f"https://{POD}.informaticacloud.com"
+    API_URL  = f"https://idmc-api.{POD}.informaticacloud.com"
+    if args.no_zips:            DOWNLOAD_ZIPS = False
+    if args.no_connections:     ENABLE_CONNECTIONS = False
+    if args.no_catalog_sources: ENABLE_CATALOG_SOURCES = False
+    if args.filter_connections:     FILTER_CONNECTIONS = args.filter_connections
+    if args.filter_catalog_sources: FILTER_CATALOG_SOURCES = args.filter_catalog_sources
+
     print("=" * 60)
     print("CDGC Export Script")
     print("=" * 60)
     print(f"\nPod      : {POD}")
     print(f"IDMC URL : {IDMC_URL}")
-    print(f"API URL  : {API_URL}")
-    print(f"Output   : {OUTPUT_DIR}/\n")
+    print(f"API URL  : {API_URL}\n")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Use a temp directory as the staging area — it is cleaned up after zipping.
+    # If cdgc_export_temp_dir is set, use it (with {timestamp} substituted);
+    # otherwise fall back to the OS default temp directory.
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if TEMP_DIR_TEMPLATE:
+        tmp_dir = TEMP_DIR_TEMPLATE.replace("{timestamp}", timestamp)
+        os.makedirs(tmp_dir, exist_ok=True)
+    else:
+        tmp_dir = tempfile.mkdtemp(prefix="cdgc_export_")
+    OUTPUT_DIR  = tmp_dir
+    CS_DIR      = os.path.join(OUTPUT_DIR, "catalog_sources")
+    CS_ZIPS_DIR = os.path.join(OUTPUT_DIR, "catalog_source_zips")
+    CONN_DIR    = os.path.join(OUTPUT_DIR, "connections")
 
-    print("[Auth] Logging in...")
-    auth = login(IDMC_URL, USERNAME, PASSWORD)  # IDMC_URL = pod_url e.g. https://dmp-us.informaticacloud.com
+    try:
+        print("[Auth] Logging in...")
+        auth = login(IDMC_URL, USERNAME, PASSWORD)
 
-    cs_count  = export_catalog_sources(auth)
-    zip_count = download_catalog_source_zips(auth)
-    roles     = export_roles(auth)
-    groups    = export_groups(auth)
-    runtimes  = export_runtime_environments(auth)
-    connections, enc_conn_csv = export_connections(auth)
-    classifications = export_classifications(auth)
+        cs_count  = 0
+        zip_count = 0
+        connections = {}
+        enc_csv     = None
 
-    print("\n  Scanning catalog sources for encrypted fields...")
-    enc_res_csv = export_encrypted_resources_csv(CS_DIR, OUTPUT_DIR)
+        if ENABLE_CATALOG_SOURCES:
+            cs_count  = export_catalog_sources(auth)
+            zip_count = download_catalog_source_zips(auth)
+
+        roles    = export_roles(auth)
+        groups   = export_groups(auth)
+        runtimes = export_runtime_environments(auth)
+
+        if ENABLE_CONNECTIONS:
+            connections = export_connections(auth)
+
+        classifications = export_classifications(auth)
+
+        print("\n  Scanning for encrypted fields...")
+        enc_csv = export_encrypted_fields_csv(
+            CONN_DIR if ENABLE_CONNECTIONS     else None,
+            CS_DIR   if ENABLE_CATALOG_SOURCES else None,
+            OUTPUT_DIR,
+        )
+
+        # -------------------------------------------------------------------------
+        # Bundle the temp staging dir into a timestamped zip, then clean up.
+        # The encrypted-fields CSV is stored with an _empty suffix so users know
+        # it needs to be filled in before use on import.
+        # -------------------------------------------------------------------------
+        org_token = normalize_name_for_filename(auth.get("org_name", ""))
+        zip_name  = f"export_{org_token}_{timestamp}.zip"
+        os.makedirs(ZIP_DIR, exist_ok=True)
+        zip_path  = os.path.join(ZIP_DIR, zip_name)
+
+        print(f"\n[Bundling] Creating {zip_path} ...")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(OUTPUT_DIR):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    arc_name  = os.path.relpath(full_path, OUTPUT_DIR)
+                    if re.match(r"encrypted_fields_\d{8}_\d{6}\.csv", arc_name):
+                        zf.write(full_path, "encrypted_fields_empty.csv")
+                    else:
+                        zf.write(full_path, arc_name)
+        print(f"  Bundled export → {zip_path}")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     print("\n" + "=" * 60)
     print("Export complete!")
-    print(f"  Catalog sources      : {cs_count} file(s) in {CS_DIR}/")
-    if DOWNLOAD_ZIPS:
-        print(f"  Custom source zips   : {zip_count} file(s) in {CS_ZIPS_DIR}/")
-    print(f"  Roles lookup         : {len(roles)} entries in {OUTPUT_DIR}/roles_lookup.json")
-    print(f"  Groups lookup        : {len(groups)} entries in {OUTPUT_DIR}/groups_lookup.json")
-    print(f"  Runtime environments : {len(runtimes)} entries in {OUTPUT_DIR}/runtime_environments_lookup.json")
-    print(f"  Connections          : {len(connections)} entries in {OUTPUT_DIR}/connections_lookup.json + files in {CONN_DIR}/")
-    print(f"  Classifications      : {len(classifications)} entries in {OUTPUT_DIR}/classifications_lookup.json")
-    if enc_conn_csv:
-        print(f"  Encrypted connections: {enc_conn_csv}")
-        print(f"  *** Fill in the Value column before running the import ***")
-    if enc_res_csv:
-        print(f"  Encrypted resources  : {enc_res_csv}")
-        print(f"  *** Fill in the Value column before running the import ***")
+    if ENABLE_CATALOG_SOURCES:
+        print(f"  Catalog sources      : {cs_count}")
+        if DOWNLOAD_ZIPS:
+            print(f"  Custom source zips   : {zip_count}")
+    print(f"  Roles                : {len(roles)}")
+    print(f"  Groups               : {len(groups)}")
+    print(f"  Runtime environments : {len(runtimes)}")
+    if ENABLE_CONNECTIONS:
+        print(f"  Connections          : {len(connections)}")
+    print(f"  Classifications      : {len(classifications)}")
+    if enc_csv:
+        print(f"\n  Encrypted fields     : encrypted_fields_empty.csv (in zip)")
+        print(f"  *** Fill in Value column, rename to encrypted_fields.csv, place in zip or next to script ***")
+    print(f"\n  Export bundle        : {zip_path}")
     print("=" * 60)
 
 

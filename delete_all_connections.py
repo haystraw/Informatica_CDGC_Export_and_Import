@@ -13,14 +13,58 @@ import os
 import sys
 import json
 import argparse
+import configparser
 import requests
+
+
+_INI_FILENAME = "cdgc_config.ini"
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_ini_cache    = None
+
+
+def _load_ini() -> dict:
+    global _ini_cache
+    if _ini_cache is not None:
+        return _ini_cache
+    cp = configparser.ConfigParser(interpolation=None)
+    for base in (_SCRIPT_DIR, os.getcwd()):
+        path = os.path.join(base, _INI_FILENAME)
+        if os.path.isfile(path):
+            cp.read(path, encoding="utf-8")
+            print(f"  [config] Loaded {path}")
+            break
+    _ini_cache = dict(cp["config"]) if cp.has_section("config") else {}
+    return _ini_cache
+
+
+def get(full_key: str, default: str = "") -> str:
+    ini = _load_ini()
+    val = ini.get(full_key.lower(), "").strip()
+    if val:
+        return val
+    for env_key in (full_key, full_key.upper()):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    return default
+
+
+def get_bool(full_key: str, default: bool = True) -> bool:
+    val = get(full_key).lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return default
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-POD      = os.getenv("IDMC_POD",      "dmp-us")
-USERNAME = os.getenv("IDMC_USERNAME", "your_username_here")
-PASSWORD = os.getenv("IDMC_PASSWORD", "your_password_here")
+P = "cdgc_delete_connections"
+POD      = get(f"{P}_pod",      "dmp-us")
+USERNAME = get(f"{P}_username", "your_username_here")
+PASSWORD = get(f"{P}_password", "your_password_here")
+CONFIRM  = get_bool(f"{P}_confirm", True)
 # ---------------------------------------------------------------------------
 
 POD_URL = f"https://{POD}.informaticacloud.com"
@@ -37,11 +81,12 @@ def login(pod_url, username, password):
     user_info  = data.get("userInfo", {})
     session_id = user_info.get("sessionId")
     org_id     = user_info.get("orgId")
+    org_name   = user_info.get("orgName", "")
     raw_base   = data.get("products", [{}])[0].get("baseApiUrl", "")
     iics_url   = raw_base[:-len("/saas")] if raw_base.endswith("/saas") else raw_base
     if not session_id:
         raise RuntimeError(f"Login failed — no sessionId. Response: {data}")
-    return {"session_id": session_id, "org_id": org_id, "iics_url": iics_url}
+    return {"session_id": session_id, "org_id": org_id, "org_name": org_name, "iics_url": iics_url}
 
 
 def session_headers(auth):
@@ -73,13 +118,23 @@ def delete_connection(auth, conn_id):
 
 
 def main():
+    global POD, USERNAME, PASSWORD, POD_URL, CONFIRM
+
     parser = argparse.ArgumentParser(description="Delete all connections in an IDMC org")
-    parser.add_argument(
-        "--go",
-        action="store_true",
-        help="Actually perform deletions (default is dry run)",
-    )
+    parser.add_argument(f"--{P}_pod",      default=POD,      metavar="POD",  dest="pod")
+    parser.add_argument(f"--{P}_username", default=USERNAME, metavar="USER", dest="username")
+    parser.add_argument(f"--{P}_password", default=PASSWORD, metavar="PASS", dest="password")
+    parser.add_argument(f"--{P}_no_confirm", action="store_true", dest="no_confirm")
+    parser.add_argument("--go", action="store_true")
     args = parser.parse_args()
+
+    POD      = args.pod
+    USERNAME = args.username
+    PASSWORD = args.password
+    if args.no_confirm:
+        CONFIRM = False
+    POD_URL  = f"https://{POD}.informaticacloud.com"
+
     dry_run = not args.go
 
     print("=" * 60)
@@ -90,7 +145,7 @@ def main():
 
     print("[Auth] Logging in...")
     auth = login(POD_URL, USERNAME, PASSWORD)
-    print(f"  Org ID   : {auth['org_id']}")
+    print(f"  Org      : {auth.get('org_name', '')} ({auth['org_id']})")
     print(f"  IICS URL : {auth['iics_url']}\n")
 
     print("Fetching connections...")
@@ -111,11 +166,14 @@ def main():
         return
 
     # Confirmation prompt
-    print(f"\n  WARNING: This will permanently delete {len(connections)} connection(s) from org {auth['org_id']}.")
-    confirm = input("  Type YES to confirm: ").strip()
-    if confirm != "YES":
-        print("  Aborted.")
-        return
+    if CONFIRM:
+        print(f"\n  WARNING: This will permanently delete {len(connections)} connection(s) from org {auth['org_id']}.")
+        confirm = input("  Type YES to confirm: ").strip()
+        if confirm != "YES":
+            print("  Aborted.")
+            return
+    else:
+        print(f"\n  Confirmation disabled; deleting {len(connections)} connection(s).")
 
     print()
     deleted = 0

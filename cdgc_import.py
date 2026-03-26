@@ -19,10 +19,12 @@ Rules (catalog sources):
   - Remaps Runtime Environment ID values the same way
 
 Usage:
-  python cdgc_import.py                           # import connections + catalog sources
-  python cdgc_import.py --connections             # connections only
-  python cdgc_import.py --catalog-sources         # catalog sources only
-  python cdgc_import.py --encrypted-fields <csv>  # apply encrypted fields CSV only
+  python cdgc_import.py [--pod POD] [--username USER] [--password PASS]
+                        [--export-dir DIR]
+                        [--filter-connections REGEX] [--filter-catalog-sources REGEX]
+                        [--no-ignore-encrypted-changes]
+                        [--connections] [--catalog-sources] [--update]
+                        [--encrypted-fields CSV_FILE]
 
 Configure via environment variables or edit the constants below:
   IDMC_POD, IDMC_USERNAME, IDMC_PASSWORD, EXPORT_DIR
@@ -38,8 +40,52 @@ import csv
 import datetime
 import argparse
 import zipfile
+import shutil
+import tempfile
 import time
+import configparser
 import requests
+
+
+_INI_FILENAME = "cdgc_config.ini"
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_ini_cache    = None
+
+
+def _load_ini() -> dict:
+    global _ini_cache
+    if _ini_cache is not None:
+        return _ini_cache
+    cp = configparser.ConfigParser(interpolation=None)
+    for base in (_SCRIPT_DIR, os.getcwd()):
+        path = os.path.join(base, _INI_FILENAME)
+        if os.path.isfile(path):
+            cp.read(path, encoding="utf-8")
+            print(f"  [config] Loaded {path}")
+            break
+    _ini_cache = dict(cp["config"]) if cp.has_section("config") else {}
+    return _ini_cache
+
+
+def get(full_key: str, default: str = "") -> str:
+    ini = _load_ini()
+    val = ini.get(full_key.lower(), "").strip()
+    if val:
+        return val
+    for env_key in (full_key, full_key.upper()):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    return default
+
+
+def get_bool(full_key: str, default: bool = True) -> bool:
+    val = get(full_key).lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return default
 
 
 class _Tee:
@@ -60,41 +106,127 @@ class _Tee:
         return getattr(self._stdout, name)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — defaults from INI > env vars > hardcoded
 # ---------------------------------------------------------------------------
-POD        = os.getenv("IDMC_POD",      "dmp-us")
-USERNAME   = os.getenv("IDMC_USERNAME", "your_username_here")
-PASSWORD   = os.getenv("IDMC_PASSWORD", "your_password_here")
-EXPORT_DIR   = os.getenv("EXPORT_DIR",    "./export")
-CONN_DIR     = os.path.join(EXPORT_DIR, "connections")
-CS_DIR       = os.path.join(EXPORT_DIR, "catalog_sources")
-CS_ZIPS_DIR  = os.path.join(EXPORT_DIR, "catalog_source_zips")
+P = "cdgc_import"
 
-# Connection fields to strip — system-assigned or org-specific
+POD      = get(f"{P}_pod",      "dmp-us")
+USERNAME = get(f"{P}_username", "your_username_here")
+PASSWORD = get(f"{P}_password", "your_password_here")
+
+EXPORT_DIR  = get(f"{P}_export_dir", "./export")
+CONN_DIR    = os.path.join(EXPORT_DIR, "connections")
+CS_DIR      = os.path.join(EXPORT_DIR, "catalog_sources")
+CS_ZIPS_DIR = os.path.join(EXPORT_DIR, "catalog_source_zips")
+
 CONN_STRIP_FIELDS = {
     "id", "orgId", "createTime", "updateTime",
     "createdBy", "updatedBy", "majorUpdateTime", "federatedId",
 }
 
-MASKED_VALUE         = "********"
-PLACEHOLDER          = "1234"
-ENCRYPTED_FIELDS_CSV     = os.path.join(EXPORT_DIR, "encrypted_fields_connections.csv")
-ENCRYPTED_RESOURCES_CSV  = os.path.join(EXPORT_DIR, "encrypted_fields_resources.csv")
+MASKED_VALUE = "********"
+PLACEHOLDER  = "1234"
 
-# When True (default): encrypted blobs (org-specific AAA… values) are treated as equivalent
-# during comparison — a source won't be updated just because the encrypted blob differs.
-# Set False to always PUT sources that contain encrypted fields, even if nothing else changed.
-IGNORE_ENCRYPTED_CHANGES = True
+ENCRYPTED_FIELDS_CSV = (
+    get(f"{P}_encrypted_fields", "")
+    or get(f"{P}_encrypted_fields_connections", "")
+    or get(f"{P}_encrypted_fields_resources", "")
+    or "encrypted_fields.csv"
+)
+
+IGNORE_ENCRYPTED_CHANGES = get_bool(f"{P}_ignore_encrypted_changes", True)
+ENABLE_CONNECTIONS       = get_bool(f"{P}_enable_connections",       True)
+ENABLE_CATALOG_SOURCES   = get_bool(f"{P}_enable_catalog_sources",   True)
+FILTER_CONNECTIONS       = get(f"{P}_filter_connections")     or None
+FILTER_CATALOG_SOURCES   = get(f"{P}_filter_catalog_sources") or None
+CONFIRM                  = get_bool(f"{P}_confirm", True)
+PROMPT_FOR_ZIP           = get_bool(f"{P}_prompt_for_zip_file", False)
+RUNTIME_MAP_TEXT         = get(f"{P}_runtime_map", "")
+RUNTIME_NAME_MAP         = {}
 
 # ---------------------------------------------------------------------------
-# Name filters (for troubleshooting — leave None to include everything)
-# Set to a regex string to import only matching connections / catalog sources.
-# Examples:
-#   FILTER_CONNECTIONS     = r"Snowflake|Oracle"
-#   FILTER_CATALOG_SOURCES = r"Lineage"
+# Export zip helpers
 # ---------------------------------------------------------------------------
-FILTER_CONNECTIONS     = None
-FILTER_CATALOG_SOURCES = None
+
+def _select_export_zip(search_dir: str = ".") -> str | None:
+    """
+    Lists export_*.zip files in search_dir (newest first) and lets the user
+    pick one interactively.  Returns the chosen path, or None if there are
+    no zips or the user cancels.
+    """
+    zips = sorted(
+        (f for f in os.listdir(search_dir) if f.startswith("export_") and f.endswith(".zip")),
+        key=lambda f: os.path.getmtime(os.path.join(search_dir, f)),
+        reverse=True,
+    )
+    if not zips:
+        print("  No export_*.zip files found in the current directory.")
+        return None
+
+    print("\nAvailable export zips (newest first):")
+    for i, name in enumerate(zips, start=1):
+        mtime = datetime.datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(search_dir, name))
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        size_kb = os.path.getsize(os.path.join(search_dir, name)) / 1024
+        print(f"  {i}. {name}  ({size_kb:.0f} KB, {mtime})")
+
+    while True:
+        try:
+            raw = input("\nEnter number to select (or 0 to cancel): ").strip()
+            choice = int(raw)
+        except ValueError:
+            print("  Please enter a number.")
+            continue
+        if choice == 0:
+            print("  Cancelled.")
+            return None
+        if 1 <= choice <= len(zips):
+            chosen = os.path.join(search_dir, zips[choice - 1])
+            print(f"  Selected: {chosen}")
+            return chosen
+        print(f"  Invalid choice — enter a number between 1 and {len(zips)}.")
+
+
+def _extract_export_zip(zip_path: str) -> str:
+    """
+    Extracts the export zip into a temp directory and returns the path.
+    The caller is responsible for cleaning up with shutil.rmtree().
+    """
+    tmp = tempfile.mkdtemp(prefix="cdgc_import_")
+    print(f"  Extracting {zip_path} → {tmp} ...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(tmp)
+    return tmp
+
+
+def _resolve_encrypted_csv(filenames, export_dir: str, zip_path: str | None) -> str | None:
+    """
+    Finds an encrypted-fields CSV using the lookup order:
+      1. Inside the extracted export zip / export_dir — looks for the first matching
+         canonical filename (e.g. encrypted_fields.csv), NOT any _empty variant
+      2. In the directory where the script lives
+      3. Not found — returns None; caller will write a new timestamped file
+    The _empty files in the zip are for the user to copy and fill in; they are NOT
+    loaded automatically.
+    """
+    if isinstance(filenames, str):
+        filenames = [filenames]
+
+    # 1. Inside the extracted zip / export_dir
+    for filename in filenames:
+        candidate = os.path.join(export_dir, filename)
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 2. Script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for filename in filenames:
+        candidate2 = os.path.join(script_dir, filename)
+        if os.path.isfile(candidate2):
+            return candidate2
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Filter helper
@@ -152,6 +284,40 @@ def _call_with_retry(method, url, label="", max_retries=4, base_delay=3, **kwarg
 def _get(url, headers, params=None, timeout=30):
     """GET with automatic retry on transient errors."""
     return _call_with_retry(requests.get, url, headers=headers, params=params, timeout=timeout)
+
+
+def _parse_runtime_map(entries):
+    """
+    Parses runtime mapping strings into:
+      { source_runtime_name_or_id: target_runtime_name }
+    """
+    mapping = {}
+    for raw_entry in entries:
+        if not raw_entry:
+            continue
+        for part in re.split(r"[;\r\n]+", raw_entry):
+            item = part.strip()
+            if not item:
+                continue
+            if "=" in item:
+                src, dst = item.split("=", 1)
+            elif ":" in item:
+                src, dst = item.split(":", 1)
+            else:
+                raise ValueError(f"Invalid runtime mapping '{item}'. Expected source=target.")
+            src = src.strip()
+            dst = dst.strip()
+            if not src or not dst:
+                raise ValueError(f"Invalid runtime mapping '{item}'. Expected source=target.")
+            mapping[src] = dst
+    return mapping
+
+
+def _find_runtime_override(source_rt_name, source_rt_id):
+    for key in (source_rt_name, source_rt_id):
+        if key and key in RUNTIME_NAME_MAP:
+            return RUNTIME_NAME_MAP[key], key
+    return None, None
 
 
 # configOptions keys whose values are connection IDs
@@ -472,42 +638,48 @@ def _apply_cs_path(obj, path_str, value):
     # 'match' as the final segment is not expected for scalar values
 
 
+def _load_encrypted_csv_rows(csv_path):
+    """Loads canonical encrypted_fields.csv rows and tolerates the legacy split schemas."""
+    rows = []
+    if not os.path.isfile(csv_path):
+        return rows
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            row_type = (row.get("Type") or "").strip()
+            name = (row.get("Name") or row.get("Connection Name") or row.get("Catalog Source Name") or "").strip()
+            param = (row.get("Parameter") or row.get("Parameter Name") or row.get("JSON Path") or "").strip()
+            value = (row.get("Value") or "").strip()
+            rows.append({"type": row_type, "name": name, "parameter": param, "value": value})
+    return rows
+
+
 def load_encrypted_resources_csv(csv_path):
     """
-    Loads a filled-in encrypted_fields_resources.csv into:
+    Loads catalog resource rows from the canonical encrypted fields CSV into:
       { catalog_source_name: { json_path: value, ... }, ... }
     Rows with an empty Value column are skipped.
     """
     result = {}
-    if not os.path.isfile(csv_path):
-        return result
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            name  = (row.get("Catalog Source Name") or "").strip()
-            path  = (row.get("JSON Path") or "").strip()
-            value = (row.get("Value") or "").strip()
-            if name and path and value:
-                result.setdefault(name, {})[path] = value
+    for row in _load_encrypted_csv_rows(csv_path):
+        if row["type"] and row["type"] != "Catalog Resource":
+            continue
+        if row["name"] and row["parameter"] and row["value"]:
+            result.setdefault(row["name"], {})[row["parameter"]] = row["value"]
     return result
 
 
 def load_encrypted_fields_csv(csv_path):
     """
-    Loads a filled-in encrypted_fields.csv into:
+    Loads connection rows from the canonical encrypted_fields.csv into:
       { connection_name: { field_path: value, ... }, ... }
     Rows with an empty Value are skipped.
     """
     updates = {}
-    if not os.path.isfile(csv_path):
-        return updates
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            conn_name  = row.get("Connection Name", "").strip()
-            field_path = row.get("Parameter Name", "").strip()
-            value      = row.get("Value", "").strip()
-            if conn_name and field_path and value:
-                updates.setdefault(conn_name, {})[field_path] = value
+    for row in _load_encrypted_csv_rows(csv_path):
+        if row["type"] and row["type"] != "Connection":
+            continue
+        if row["name"] and row["parameter"] and row["value"]:
+            updates.setdefault(row["name"], {})[row["parameter"]] = row["value"]
     return updates
 
 
@@ -553,6 +725,19 @@ def _resolve_conn_runtime(source_rt_name, source_rt_id, target_runtimes):
         agents = rt.get("agents", [])
         return agents[0]["id"] if agents else None
 
+    override_target_name, override_source_key = _find_runtime_override(source_rt_name, source_rt_id)
+    if override_target_name:
+        for rt in target_runtimes:
+            if rt.get("name") == override_target_name:
+                return (
+                    rt["id"], rt["name"], first_agent_id(rt),
+                    f"configured mapping ({override_source_key}->{override_target_name})",
+                )
+        raise RuntimeError(
+            f"Configured runtime mapping '{override_source_key}->{override_target_name}' "
+            f"did not match any target runtime."
+        )
+
     # Serverless → cloud-hosted agent mapping
     # Check both name and id — source org may store 'MultiTenantServerless' as the raw ID
     if source_rt_name in _SERVERLESS_RUNTIME_NAMES or source_rt_id in _SERVERLESS_RUNTIME_NAMES:
@@ -579,12 +764,12 @@ def _resolve_conn_runtime(source_rt_name, source_rt_id, target_runtimes):
 def import_connections(auth, target_runtimes, source_rt_id_to_name, update_mode=False, run_dir="."):
     if not os.path.isdir(CONN_DIR):
         print(f"  Connections folder not found: {CONN_DIR} — skipping.")
-        return
+        return {}
 
     conn_files = [f for f in os.listdir(CONN_DIR) if f.endswith(".json")]
     if not conn_files:
         print("  No connection files found to import.")
-        return
+        return get_existing_connections(auth)
 
     print(f"  Found {len(conn_files)} connection file(s) in {CONN_DIR}/")
 
@@ -597,7 +782,7 @@ def import_connections(auth, target_runtimes, source_rt_id_to_name, update_mode=
         print(f"\n  Loaded encrypted fields CSV: {ENCRYPTED_FIELDS_CSV}")
         print(f"  {len(enc_csv_data)} connection(s) have values staged")
     else:
-        print(f"\n  No encrypted_fields_connections.csv found at {ENCRYPTED_FIELDS_CSV} — encrypted fields will need manual entry")
+        print(f"\n  No encrypted_fields.csv found at {ENCRYPTED_FIELDS_CSV} — encrypted fields will need manual entry")
 
     if update_mode:
         print("\n  UPDATE MODE: existing connections will be updated with export payload")
@@ -698,14 +883,14 @@ def import_connections(auth, target_runtimes, source_rt_id_to_name, update_mode=
                 print(f"             FAILED {resp.status_code}: {resp.text[:300]}")
                 failed += 1
 
-    report_path = os.path.join(run_dir, "import_encrypted_fields_connections.csv")
+    report_path = os.path.join(run_dir, "import_encrypted_fields.csv")
     try:
         with open(report_path, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["Connection Name", "Parameter Name", "Value"])
+            writer.writerow(["Type", "Name", "Parameter", "Value"])
             for conn_name, field_path in enc_log:
                 existing_val = enc_csv_data.get(conn_name, {}).get(field_path, "")
-                writer.writerow([conn_name, field_path, existing_val])
+                writer.writerow(["Connection", conn_name, field_path, existing_val])
         if enc_log:
             uniq = len({r[0] for r in enc_log})
             print(f"\n  Encrypted fields report: {report_path}")
@@ -716,6 +901,7 @@ def import_connections(auth, target_runtimes, source_rt_id_to_name, update_mode=
         print(f"\n  WARNING: Could not write encrypted fields report — permission denied.")
 
     print(f"\n  Connections — Created: {created}  Updated: {updated}  Skipped: {skipped}  Failed: {failed}")
+    return get_existing_connections(auth)
 
 
 # ---------------------------------------------------------------------------
@@ -946,6 +1132,18 @@ def _resolve_cs_runtime(source_rt_name, source_rt_id, target_runtimes):
     """
     target_rt_name_to_id = {rt["name"]: rt["id"] for rt in target_runtimes}
 
+    override_target_name, override_source_key = _find_runtime_override(source_rt_name, source_rt_id)
+    if override_target_name:
+        if override_target_name in target_rt_name_to_id:
+            return (
+                target_rt_name_to_id[override_target_name],
+                f"configured mapping ({override_source_key}->{override_target_name})",
+            )
+        raise RuntimeError(
+            f"Configured runtime mapping '{override_source_key}->{override_target_name}' "
+            f"did not match any target runtime."
+        )
+
     # Serverless → cloud-hosted agent mapping
     # Check both name and id — source org may store 'MultiTenantServerless' as the raw ID
     if source_rt_name in _SERVERLESS_RUNTIME_NAMES or source_rt_id in _SERVERLESS_RUNTIME_NAMES:
@@ -1113,7 +1311,7 @@ def build_catalog_source_plan(auth, target_runtimes, source_rt_id_to_name,
     Builds the full execution plan for catalog source import.  For each source:
       - Remaps IDs (runtime env, connections)
       - Detects and logs encrypted fields
-      - Applies values from encrypted_fields_resources.csv where available
+      - Applies catalog resource values from encrypted_fields.csv where available
       - For existing sources: fetches current payload and compares to determine
         UPDATE (changed) vs SKIP (unchanged)
 
@@ -1182,7 +1380,7 @@ def build_catalog_source_plan(auth, target_runtimes, source_rt_id_to_name,
 
         cleared = clear_encrypted_cs_fields(payload)
 
-        # Apply pre-filled values from encrypted_fields_resources.csv
+        # Apply pre-filled catalog resource values from encrypted_fields.csv
         cs_enc_map    = enc_res_map.get(name, {})
         applied_paths = set()
         for json_path in cleared:
@@ -1371,7 +1569,7 @@ def import_catalog_sources(auth, target_runtimes, source_rt_id_to_name, source_c
 
     if plan is None:
         # Standalone call (no pre-built plan) — build plan now
-        enc_res_map = load_encrypted_resources_csv(ENCRYPTED_RESOURCES_CSV)
+        enc_res_map = load_encrypted_resources_csv(ENCRYPTED_FIELDS_CSV)
         target_conn_name_to_id = get_existing_connections(auth)
         plan, _ = build_catalog_source_plan(
             auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
@@ -1542,13 +1740,15 @@ def import_catalog_sources(auth, target_runtimes, source_rt_id_to_name, source_c
             print(f"             FAILED {resp.status_code}: {resp.text[:300]}")
             failed += 1
 
-    report_path = os.path.join(run_dir, "import_encrypted_fields_resources.csv")
+    report_path = os.path.join(run_dir, "import_encrypted_fields.csv")
     try:
-        with open(report_path, "w", newline="", encoding="utf-8") as csvfile:
+        mode = "a" if os.path.isfile(report_path) else "w"
+        with open(report_path, mode, newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["Catalog Source Name", "JSON Path", "Value"])
+            if mode == "w":
+                writer.writerow(["Type", "Name", "Parameter", "Value"])
             for cs_name, json_path in enc_res_log:
-                writer.writerow([cs_name, json_path, ""])
+                writer.writerow(["Catalog Resource", cs_name, json_path, ""])
         if enc_res_log:
             uniq = len({r[0] for r in enc_res_log})
             print(f"\n  Encrypted resource fields: {report_path}")
@@ -1585,18 +1785,15 @@ def apply_encrypted_fields(auth, csv_file):
     print(f"  Found {len(conn_lookup)} connection(s) in target org\n")
 
     updates, skipped_empty = {}, 0
-    with open(csv_file, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            conn_name  = row.get("Connection Name", "").strip()
-            field_path = row.get("Parameter Name", "").strip()
-            value      = row.get("Value", "").strip()
-            if not conn_name or not field_path:
-                continue
-            if not value:
-                skipped_empty += 1
-                continue
-            updates.setdefault(conn_name, {})[field_path] = value
+    for row in _load_encrypted_csv_rows(csv_file):
+        if row["type"] and row["type"] != "Connection":
+            continue
+        if not row["name"] or not row["parameter"]:
+            continue
+        if not row["value"]:
+            skipped_empty += 1
+            continue
+        updates.setdefault(row["name"], {})[row["parameter"]] = row["value"]
 
     if not updates:
         print("  No values to apply.")
@@ -1653,149 +1850,259 @@ def apply_encrypted_fields(auth, csv_file):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="CDGC Import — connections and catalog sources")
-    parser.add_argument("--connections",     action="store_true",
-                        help="Import connections only (default: both)")
-    parser.add_argument("--catalog-sources", action="store_true",
-                        help="Import catalog sources only (default: both)")
+    global POD, USERNAME, PASSWORD, EXPORT_DIR, FILTER_CONNECTIONS, FILTER_CATALOG_SOURCES
+    global IGNORE_ENCRYPTED_CHANGES, ENABLE_CONNECTIONS, ENABLE_CATALOG_SOURCES
+    global CONN_DIR, CS_DIR, CS_ZIPS_DIR
+    global ENCRYPTED_FIELDS_CSV, CONFIRM, RUNTIME_NAME_MAP
+
+    parser = argparse.ArgumentParser(description="Import CDGC connections and catalog sources")
+    parser.add_argument(f"--{P}_pod",                    default=POD,      metavar="POD",  dest="pod")
+    parser.add_argument(f"--{P}_username",               default=USERNAME, metavar="USER", dest="username")
+    parser.add_argument(f"--{P}_password",               default=PASSWORD, metavar="PASS", dest="password")
+    parser.add_argument(f"--{P}_export_zip",             default=None,     metavar="ZIP",  dest="export_zip")
+    parser.add_argument(f"--{P}_export_dir",             default=EXPORT_DIR, metavar="DIR", dest="export_dir")
+    parser.add_argument(f"--{P}_enable_connections",     default=None, action="store_true",  dest="enable_connections")
+    parser.add_argument(f"--{P}_no_connections",         action="store_true", dest="no_connections")
+    parser.add_argument(f"--{P}_enable_catalog_sources", default=None, action="store_true",  dest="enable_catalog_sources")
+    parser.add_argument(f"--{P}_no_catalog_sources",     action="store_true", dest="no_catalog_sources")
+    parser.add_argument(f"--{P}_filter_connections",     default=FILTER_CONNECTIONS,     metavar="REGEX", dest="filter_connections")
+    parser.add_argument(f"--{P}_filter_catalog_sources", default=FILTER_CATALOG_SOURCES, metavar="REGEX", dest="filter_catalog_sources")
+    parser.add_argument(f"--{P}_encrypted_fields",             default=ENCRYPTED_FIELDS_CSV, metavar="CSV", dest="enc_csv")
+    parser.add_argument(f"--{P}_encrypted_fields_connections", default=None,                 metavar="CSV", dest="enc_conn_csv")
+    parser.add_argument(f"--{P}_encrypted_fields_resources",   default=None,                 metavar="CSV", dest="enc_res_csv")
+    parser.add_argument(f"--{P}_runtime_map", action="append", default=None, metavar="SRC=DST", dest="runtime_maps",
+                        help="Map a source runtime name/id to a target runtime name; may be repeated")
+    parser.add_argument(f"--{P}_no_confirm", action="store_true", dest="no_confirm")
+    parser.add_argument(f"--{P}_no_ignore_encrypted_changes",  action="store_true", dest="no_ignore_encrypted")
+    # Legacy short args kept for backwards compatibility
+    parser.add_argument("--connections",      action="store_true", dest="legacy_connections")
+    parser.add_argument("--catalog-sources",  action="store_true", dest="legacy_catalog_sources")
+    parser.add_argument("--encrypted-fields", metavar="CSV",       dest="legacy_enc_fields")
+    # Legacy --update kept for backwards compatibility
     parser.add_argument("--update",          action="store_true",
                         help="Update existing connections with export payload (default: skip existing)")
-    parser.add_argument("--encrypted-fields", metavar="CSV_FILE",
-                        help="Apply encrypted fields from a specific CSV file only — skips all other steps")
     args = parser.parse_args()
 
-    # If neither specific flag is set, run both
-    run_connections     = args.connections or (not args.connections and not args.catalog_sources)
-    run_catalog_sources = args.catalog_sources or (not args.connections and not args.catalog_sources)
+    POD                    = args.pod
+    USERNAME               = args.username
+    PASSWORD               = args.password
+    EXPORT_DIR             = args.export_dir
+    FILTER_CONNECTIONS     = args.filter_connections
+    FILTER_CATALOG_SOURCES = args.filter_catalog_sources
+    if args.no_confirm:
+        CONFIRM = False
+    if args.no_ignore_encrypted:
+        IGNORE_ENCRYPTED_CHANGES = False
+    try:
+        RUNTIME_NAME_MAP = _parse_runtime_map(([RUNTIME_MAP_TEXT] if RUNTIME_MAP_TEXT else []) + (args.runtime_maps or []))
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
-    pod_url = f"https://{POD}.informaticacloud.com"
+    # Legacy --connections / --catalog-sources → force run
+    explicit_connections     = args.legacy_connections
+    explicit_catalog_sources = args.legacy_catalog_sources
 
-    # Create a timestamped run folder and start logging to it
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir   = os.path.join("import_runs", f"import_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
-    sys.stdout = _Tee(os.path.join(run_dir, "import.log"))
+    # --cdgc_import_no_connections / --cdgc_import_no_catalog_sources always disable
+    run_connections     = (ENABLE_CONNECTIONS     or explicit_connections)     and not args.no_connections
+    run_catalog_sources = (ENABLE_CATALOG_SOURCES or explicit_catalog_sources) and not args.no_catalog_sources
 
-    print("=" * 60)
-    print("CDGC Import")
-    print("=" * 60)
-    print(f"\nPOD      : {POD}")
-    print(f"Pod URL  : {pod_url}")
-    print(f"Source   : {EXPORT_DIR}/")
-    print(f"Run dir  : {run_dir}/")
+    neither_explicit = not explicit_connections and not explicit_catalog_sources
+    # If neither flag was set and both are disabled in INI, fall back to running both
+    # (preserves legacy behaviour when INI is absent)
+    if neither_explicit and not run_connections and not run_catalog_sources:
+        run_connections = run_catalog_sources = True
 
-    print("\n[Auth] Logging in...")
-    auth = login(pod_url, USERNAME, PASSWORD)
+    _tmp_dir = None
+    try:
+        # If no zip was specified and prompting is enabled, let the user choose one.
+        if not args.export_zip and PROMPT_FOR_ZIP:
+            args.export_zip = _select_export_zip(os.path.dirname(os.path.abspath(__file__)))
+            if not args.export_zip:
+                sys.exit(0)
 
-    # Mode: apply encrypted fields only
-    if args.encrypted_fields:
-        if not os.path.isfile(args.encrypted_fields):
-            print(f"\nERROR: File not found: {args.encrypted_fields}")
-            sys.exit(1)
-        apply_encrypted_fields(auth, args.encrypted_fields)
-        return
+        # Handle --cdgc_import_export_zip: extract to a temp directory and use that as EXPORT_DIR
+        if args.export_zip:
+            if not os.path.isfile(args.export_zip):
+                print(f"ERROR: Export zip not found: {args.export_zip}")
+                sys.exit(1)
+            _tmp_dir = _extract_export_zip(args.export_zip)
+            EXPORT_DIR  = _tmp_dir
+            CONN_DIR    = os.path.join(EXPORT_DIR, "connections")
+            CS_DIR      = os.path.join(EXPORT_DIR, "catalog_sources")
+            CS_ZIPS_DIR = os.path.join(EXPORT_DIR, "catalog_source_zips")
+        else:
+            CONN_DIR    = os.path.join(EXPORT_DIR, "connections")
+            CS_DIR      = os.path.join(EXPORT_DIR, "catalog_sources")
+            CS_ZIPS_DIR = os.path.join(EXPORT_DIR, "catalog_source_zips")
 
-    # Load shared source org lookups (runtime envs + connections)
-    print("\n[Lookups] Loading source org lookup files...")
-    source_rt_id_to_name, source_conn_id_to_name, source_cs_name_to_id = load_source_lookups()
+        # Resolve the canonical encrypted fields CSV first, then fall back to legacy split names.
+        enc_filenames = []
+        for name in (
+            args.enc_csv,
+            args.enc_conn_csv,
+            args.enc_res_csv,
+            "encrypted_fields.csv",
+            "encrypted_fields_connections.csv",
+            "encrypted_fields_resources.csv",
+        ):
+            if name and name not in enc_filenames:
+                enc_filenames.append(name)
+        enc_csv = _resolve_encrypted_csv(enc_filenames, EXPORT_DIR, args.export_zip)
+        if enc_csv:
+            print(f"  Encrypted fields CSV: {enc_csv}")
+            ENCRYPTED_FIELDS_CSV = enc_csv
 
-    # Fetch target runtime environments once — shared by both import steps
-    print("\n  Fetching runtime environments in target org...")
-    target_runtimes = get_runtime_environments(auth)
-    print(f"  Target org has {len(target_runtimes)} runtime environment(s).")
-    for rt in target_runtimes:
-        agents = rt.get("agents", [])
-        active = any(a.get("active") is True for a in agents)
-        print(f"    - {rt.get('name')} ({rt.get('id')})  agents={len(agents)}  active={active}")
+        pod_url = f"https://{POD}.informaticacloud.com"
 
-    # ---------------------------------------------------------------------------
-    # Pre-flight: build full plan and display before executing anything
-    # ---------------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("[Pre-flight]")
-    print("=" * 60)
+        # Create a timestamped run folder and start logging to it
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir   = os.path.join("import_runs", f"import_{timestamp}")
+        os.makedirs(run_dir, exist_ok=True)
+        sys.stdout = _Tee(os.path.join(run_dir, "import.log"))
 
-    existing_conns = get_existing_connections(auth)
-
-    # --- Connections plan ---
-    conn_plan = []
-    if run_connections and os.path.isdir(CONN_DIR):
-        conn_files = sorted(f for f in os.listdir(CONN_DIR) if f.endswith(".json"))
-        for fname in conn_files:
-            with open(os.path.join(CONN_DIR, fname), encoding="utf-8") as f:
-                conn = json.load(f)
-            cname  = conn.get("name", fname)
-            if not _name_matches(cname, FILTER_CONNECTIONS):
-                continue
-            action = ("UPDATE" if args.update else "SKIP") if cname in existing_conns else "CREATE"
-            conn_plan.append({"name": cname, "action": action})
-
-    # --- Catalog sources plan (includes comparisons for existing sources) ---
-    cs_plan      = []
-    missing_types = []
-    if run_catalog_sources:
-        enc_res_map = load_encrypted_resources_csv(ENCRYPTED_RESOURCES_CSV)
-        if enc_res_map:
-            print(f"\n  Encrypted resource fields CSV loaded: {ENCRYPTED_RESOURCES_CSV}")
-        print("\n  Building catalog source plan (comparing existing sources to export)...")
-        cs_plan, missing_types = build_catalog_source_plan(
-            auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
-            source_cs_name_to_id, existing_conns, enc_res_map,
-        )
-
-    # --- Display consolidated plan ---
-    if conn_plan:
-        print(f"\n  Connections ({len(conn_plan)} total):")
-        for item in conn_plan:
-            print(f"    {item['action']:<6} : {item['name']}")
-
-    if missing_types:
-        print(f"\n  Custom datasource type(s) missing from target org — will be created:")
-        for t in missing_types:
-            print(f"    CREATE type : {t}")
-
-    if cs_plan:
-        counts = {"CREATE": 0, "UPDATE": 0, "SKIP": 0}
-        for item in cs_plan:
-            counts[item["action"]] += 1
-        print(f"\n  Catalog Sources ({len(cs_plan)} total — "
-              f"Create: {counts['CREATE']}  Update: {counts['UPDATE']}  Skip: {counts['SKIP']}):")
-        for item in cs_plan:
-            enc_note = f"  [{len(item['enc_res_log'])} encrypted field(s) need re-entry]" if item["enc_res_log"] else ""
-            print(f"    {item['action']:<6} : {item['name']}{item['label']}{enc_note}")
-            for reason in item.get("diff_reasons", []):
-                print(f"             ~ {reason}")
-
-    # --- Single confirmation prompt ---
-    print()
-    confirm = input("  Proceed with import? (YES to continue, Enter to abort): ").strip()
-    if confirm.upper() != "YES":
-        print("  Aborted.")
-        return
-
-    # ---------------------------------------------------------------------------
-    # Execute
-    # ---------------------------------------------------------------------------
-    if run_connections:
-        print("\n" + "=" * 60)
-        print("[Connections]")
         print("=" * 60)
-        import_connections(auth, target_runtimes, source_rt_id_to_name, update_mode=args.update,
-                          run_dir=run_dir)
-
-    if run_catalog_sources:
-        print("\n" + "=" * 60)
-        print("[Catalog Sources]")
+        print("CDGC Import")
         print("=" * 60)
+        print(f"\nPOD      : {POD}")
+        print(f"Pod URL  : {pod_url}")
+        print(f"Source   : {EXPORT_DIR}/")
+        print(f"Run dir  : {run_dir}/")
+        if args.export_zip:
+            print(f"Zip      : {args.export_zip}")
+        if RUNTIME_NAME_MAP:
+            print("Runtime mappings:")
+            for src, dst in sorted(RUNTIME_NAME_MAP.items()):
+                print(f"  {src} -> {dst}")
+
+        print("\n[Auth] Logging in...")
+        auth = login(pod_url, USERNAME, PASSWORD)
+
+        # Mode: apply encrypted fields only (legacy --encrypted-fields arg)
+        if args.legacy_enc_fields:
+            if not os.path.isfile(args.legacy_enc_fields):
+                print(f"\nERROR: File not found: {args.legacy_enc_fields}")
+                sys.exit(1)
+            apply_encrypted_fields(auth, args.legacy_enc_fields)
+            return
+
+        # Load shared source org lookups (runtime envs + connections)
+        print("\n[Lookups] Loading source org lookup files...")
+        source_rt_id_to_name, source_conn_id_to_name, source_cs_name_to_id = load_source_lookups()
+
+        # Fetch target runtime environments once — shared by both import steps
+        print("\n  Fetching runtime environments in target org...")
+        target_runtimes = get_runtime_environments(auth)
+        print(f"  Target org has {len(target_runtimes)} runtime environment(s).")
+        for rt in target_runtimes:
+            agents = rt.get("agents", [])
+            active = any(a.get("active") is True for a in agents)
+            print(f"    - {rt.get('name')} ({rt.get('id')})  agents={len(agents)}  active={active}")
+
+        # -----------------------------------------------------------------------
+        # Pre-flight: build full plan and display before executing anything
+        # -----------------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print("[Pre-flight]")
+        print("=" * 60)
+
+        existing_conns = get_existing_connections(auth)
+
+        # --- Connections plan ---
+        conn_plan = []
+        if run_connections and os.path.isdir(CONN_DIR):
+            conn_files = sorted(f for f in os.listdir(CONN_DIR) if f.endswith(".json"))
+            for fname in conn_files:
+                with open(os.path.join(CONN_DIR, fname), encoding="utf-8") as f:
+                    conn = json.load(f)
+                cname  = conn.get("name", fname)
+                if not _name_matches(cname, FILTER_CONNECTIONS):
+                    continue
+                action = ("UPDATE" if args.update else "SKIP") if cname in existing_conns else "CREATE"
+                conn_plan.append({"name": cname, "action": action})
+
+        # --- Catalog sources plan (includes comparisons for existing sources) ---
+        cs_plan       = []
+        missing_types = []
+        if run_catalog_sources:
+            enc_res_map = load_encrypted_resources_csv(ENCRYPTED_FIELDS_CSV)
+            if enc_res_map:
+                print(f"\n  Encrypted resource fields CSV loaded: {ENCRYPTED_FIELDS_CSV}")
+            print("\n  Building catalog source plan (comparing existing sources to export)...")
+            cs_plan, missing_types = build_catalog_source_plan(
+                auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
+                source_cs_name_to_id, existing_conns, enc_res_map,
+            )
+
+        # --- Display consolidated plan ---
+        if conn_plan:
+            print(f"\n  Connections ({len(conn_plan)} total):")
+            for item in conn_plan:
+                print(f"    {item['action']:<6} : {item['name']}")
+
         if missing_types:
-            print("\n  Creating missing datasource types...")
-            create_datasource_types(auth, missing_types)
-        import_catalog_sources(auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
-                               source_cs_name_to_id, run_dir=run_dir, plan=cs_plan)
+            print(f"\n  Custom datasource type(s) missing from target org — will be created:")
+            for t in missing_types:
+                print(f"    CREATE type : {t}")
 
-    print("\n" + "=" * 60)
-    print("Import complete.")
-    print("=" * 60)
+        if cs_plan:
+            counts = {"CREATE": 0, "UPDATE": 0, "SKIP": 0}
+            for item in cs_plan:
+                counts[item["action"]] += 1
+            print(f"\n  Catalog Sources ({len(cs_plan)} total — "
+                  f"Create: {counts['CREATE']}  Update: {counts['UPDATE']}  Skip: {counts['SKIP']}):")
+            for item in cs_plan:
+                enc_note = f"  [{len(item['enc_res_log'])} encrypted field(s) need re-entry]" if item["enc_res_log"] else ""
+                print(f"    {item['action']:<6} : {item['name']}{item['label']}{enc_note}")
+                for reason in item.get("diff_reasons", []):
+                    print(f"             ~ {reason}")
+
+        # --- Single confirmation prompt ---
+        if CONFIRM:
+            print()
+            confirm = input("  Proceed with import? (YES to continue, Enter to abort): ").strip()
+            if confirm.upper() != "YES":
+                print("  Aborted.")
+                return
+        else:
+            print("\n  Confirmation disabled; proceeding with import.")
+
+        # -----------------------------------------------------------------------
+        # Execute
+        # -----------------------------------------------------------------------
+        if run_connections:
+            print("\n" + "=" * 60)
+            print("[Connections]")
+            print("=" * 60)
+            existing_conns = import_connections(
+                auth, target_runtimes, source_rt_id_to_name,
+                update_mode=args.update, run_dir=run_dir,
+            )
+
+        if run_catalog_sources:
+            print("\n" + "=" * 60)
+            print("[Catalog Sources]")
+            print("=" * 60)
+            if run_connections:
+                print("\n  Refreshing catalog source plan with current target connection IDs...")
+                enc_res_map = load_encrypted_resources_csv(ENCRYPTED_FIELDS_CSV)
+                cs_plan, missing_types = build_catalog_source_plan(
+                    auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
+                    source_cs_name_to_id, existing_conns, enc_res_map,
+                )
+            if missing_types:
+                print("\n  Creating missing datasource types...")
+                create_datasource_types(auth, missing_types)
+            import_catalog_sources(auth, target_runtimes, source_rt_id_to_name, source_conn_id_to_name,
+                                   source_cs_name_to_id, run_dir=run_dir, plan=cs_plan)
+
+        print("\n" + "=" * 60)
+        print("Import complete.")
+        print("=" * 60)
+
+    finally:
+        if _tmp_dir and os.path.isdir(_tmp_dir):
+            shutil.rmtree(_tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
